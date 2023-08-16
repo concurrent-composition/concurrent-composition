@@ -20,14 +20,8 @@ class Metric(object):
 class Measure(object):
     descriptor: str
 
-    def concurrent_composition(self, d_mids):
-        if self.descriptor == "RenyiDivergence":
-            return lambda alpha: sum(d_mid(alpha) for d_mid in d_mids)
-        if self.descriptor.startswith("FixedRenyiDivergence"):
-            return sum(d_mids)
-        raise ValueError("Unknown measure of privacy")
-    
-    def sequential_composition(self, d_mids):
+    # WARNING: these maps are for demo purposes only, and are overly simplified
+    def compose(self, d_mids):
         if self.descriptor == "RenyiDivergence":
             return lambda alpha: sum(d_mid(alpha) for d_mid in d_mids)
         if self.descriptor.startswith("FixedRenyiDivergence"):
@@ -176,6 +170,24 @@ def make_fix_alpha(measurement, alpha):
     )
 
 
+def make_interactive(measurement):
+    """Makes any measurement trivially interactive"""
+
+    def function(data):
+        release = measurement.function(data)
+        def transition(_, _query):
+            return release
+        return Queryable(transition)
+    
+    return Measurement(
+        input_domain=measurement.input_domain,
+        function=function,
+        input_metric=measurement.input_metric,
+        output_measure=measurement.output_measure,
+        privacy_map=measurement.privacy_map
+    )
+
+
 def make_sequential_odometer(input_domain, input_metric, output_measure):
     def function(data):
         # queryable state
@@ -209,7 +221,7 @@ def make_sequential_odometer(input_domain, input_metric, output_measure):
 
             if isinstance(query, Map):
                 d_mids = [child_map(query.d_in) for child_map in child_maps]
-                return output_measure.sequential_composition(d_mids)
+                return output_measure.compose(d_mids)
 
             # This is needed to answer queries about the hypothetical privacy consumption after running a query.
             # This gives the filter a way to reject queries that would cause the privacy consumption to exceed the budget.
@@ -221,7 +233,7 @@ def make_sequential_odometer(input_domain, input_metric, output_measure):
                     raise ValueError("Unknown query")
 
                 def pending_map(d_in):
-                    return output_measure.sequential_composition(
+                    return output_measure.compose(
                         [child_map(d_in) for child_map in pending_child_maps]
                     )
                 return pending_map
@@ -239,7 +251,7 @@ def make_sequential_odometer(input_domain, input_metric, output_measure):
                 pending_child_maps[query.id] = query.pending_map
                 def pending_map(d_in):
                     d_mids = [child_map(d_in) for child_map in pending_child_maps]
-                    return output_measure.sequential_composition(d_mids)
+                    return output_measure.compose(d_mids)
                 return pending_map
             
             raise ValueError("Unknown query", query)
@@ -276,7 +288,7 @@ def make_concurrent_odometer(input_domain, input_metric, output_measure):
 
             if isinstance(query, Map):
                 d_mids = [child_map(query.d_in) for child_map in child_maps]
-                return output_measure.concurrent_composition(d_mids)
+                return output_measure.compose(d_mids)
 
             # This is needed to answer queries about the hypothetical privacy consumption after running a query.
             # This gives the filter a way to reject the query before the state is changed.
@@ -287,7 +299,7 @@ def make_concurrent_odometer(input_domain, input_metric, output_measure):
                                         query.proposed_query.privacy_map]
                         d_mids = [child_map(d_in)
                                   for child_map in pending_maps]
-                        return output_measure.concurrent_composition(d_mids)
+                        return output_measure.compose(d_mids)
                     return pending_map
             raise ValueError(f"unrecognized query: {query}")
 
@@ -415,6 +427,9 @@ def test_concurrent_odometer():
     """Construct a concurrent odometer and send it a couple queries."""
     gaussian_meas = make_base_gaussian(
         scale=1., output_measure=Measure("RenyiDivergence"))
+    
+    # for simplicity, we demonstrate with a trivially interactive mechanism
+    interactive_gaussian_meas = make_interactive(gaussian_meas)
 
     odo = make_concurrent_odometer(
         input_domain=gaussian_meas.input_domain,
@@ -428,17 +443,53 @@ def test_concurrent_odometer():
     print("Privacy consumption starts at zero. If sensitivity is 1, and alpha is 3, then the privacy consumption should be 0.")
     print(odo_qbl.eval(Map(d_in=1.))(alpha=3.))
 
-    print("Now we make a release on our 'agg' dataset with the gaussian mechanism.")
-    print(odo_qbl.eval(gaussian_meas))
+    print("Now we make a release on our 'agg' dataset with the interactive gaussian mechanism.")
+    q1 = odo_qbl.eval(interactive_gaussian_meas)
 
     print("Epsilon is now 1.5")
     print(odo_qbl.eval(Map(d_in=1.))(alpha=3.))
 
-    print("Make a second release on our 'agg' dataset with the gaussian mechanism.")
+    print("Make a second release on our 'agg' dataset.")
     print(odo_qbl.eval(gaussian_meas))
 
     print("Epsilon is now 3.")
     print(odo_qbl.eval(Map(d_in=1.))(alpha=3.))
+
+    print("Since this compositor allows concurrency, we can still interact with the first query.")
+    print(q1.eval(None))
+
+def test_sequential_odometer():
+    """Construct a sequential odometer and show how it restricts interaction with an earlier query."""
+    gaussian_meas = make_base_gaussian(
+        scale=1., output_measure=Measure("RenyiDivergence"))
+    
+    # for simplicity, we demonstrate with a trivially interactive mechanism
+    interactive_gaussian_meas = make_interactive(gaussian_meas)
+
+    odo = make_sequential_odometer(
+        input_domain=gaussian_meas.input_domain,
+        input_metric=gaussian_meas.input_metric,
+        output_measure=gaussian_meas.output_measure,
+    )
+
+    agg = 2.
+
+    odo_qbl = odo.function(agg)
+    print("Privacy consumption starts at zero. If sensitivity is 1, and alpha is 3, then the privacy consumption should be 0.")
+    print(odo_qbl.eval(Map(d_in=1.))(alpha=3.))
+
+    print("Now we make a release on our 'agg' dataset with the interactive gaussian mechanism.")
+    q1 = odo_qbl.eval(interactive_gaussian_meas)
+
+    print("Make a second release on our 'agg' dataset.")
+    print(odo_qbl.eval(gaussian_meas))
+
+    print("Since this compositor is sequential, we can no longer interact with the first query.")
+    try:
+        q1.eval(None)
+        assert False, "the above statement should fail"
+    except ValueError as e:
+        print("sequential compositor rejected the release because another query has been sent:", e)
 
 
 def test_concurrent_filter():
@@ -478,6 +529,7 @@ def test_concurrent_filter():
 
 if __name__ == "__main__":
     test_concurrent_odometer()
+    test_sequential_odometer()
     test_concurrent_filter()
 
     print("All tests passed!")
